@@ -16,12 +16,13 @@
 
 -export([start_link/1, start_link/2, start_link/3, stop/1]).
 -export([set_timeout/2, prompt/2, killer/1]).
--export([send/2, writeline/2, readline/1, writejson/2, readjson/1]).
+-export([send/2, writeline/2, readline/1, writejson/2, readjson/1, writebert/2, readbert/1]).
 -export([init/1, terminate/2, handle_call/3, handle_cast/2, handle_info/2, code_change/3]).
 
 -include_lib("couch/include/couch_db.hrl").
 
 -define(PORT_OPTIONS, [stream, {line, 4096}, binary, exit_status, hide]).
+-define(PORT_OPTIONS_BERT, [stream, {packet, 4}, binary, exit_status, hide]).
 
 -record(os_proc,
     {command,
@@ -125,6 +126,41 @@ readjson(OsProc) when is_record(OsProc, os_proc) ->
         end
     end.
 
+writebert(OsProc, Data) when is_record(OsProc, os_proc) ->
+    couch_log:info("OS BERT Process ~p Input  ::",
+                    [Data]),
+    [Command | Payload] = Data,
+    ToSend = case Command of 
+		    <<"reset">> -> 
+			     {Inner} = hd(Payload),
+			     [Command, {bert, dict, Inner}]; 
+		    <<"map_doc">> -> 
+			     {Inner} = hd(Payload),
+			     [Command, {bert, dict, Inner}]; 
+		    _ -> Data
+	     end,
+    couch_log:info("OS BERT Process ToSend ~p ",
+                    [ToSend]),
+
+    Bert = bert:encode(ToSend), 
+    port_command(OsProc#os_proc.port, Bert).
+
+readbertpacket(#os_proc{port = Port} = OsProc) ->
+    receive
+    {Port, {data, Data}}  ->
+    	Data
+    after OsProc#os_proc.timeout ->
+        catch port_close(Port),
+        throw({os_process_error, "bert packet OS process timed out."})
+    end.
+
+readbert(OsProc) when is_record(OsProc, os_proc) ->
+    couch_log:info("OS BERT Process read ~p", [OsProc#os_proc.port]),
+    Line = iolist_to_binary(readbertpacket(OsProc)),
+    Value = bert:decode(Line),
+    couch_log:info("OS BERT Process read value ~p", [Value]),
+    Value. 
+
 pick_command(Line) ->
     json_stream_parse:events(Line, fun pick_command0/1).
 
@@ -145,26 +181,41 @@ pick_command1(_) ->
 
 % gen_server API
 init([Command, Options, PortOptions]) ->
+    couch_log:info("OS Process Start :: ~s", [Command]),
     PrivDir = couch_util:priv_dir(),
     Spawnkiller = "\"" ++ filename:join(PrivDir, "couchspawnkillable") ++ "\"",
     V = config:get("query_server_config", "os_process_idle_limit", "300"),
     IdleLimit = list_to_integer(V) * 1000,
-    BaseProc = #os_proc{
-        command=Command,
-        port=open_port({spawn, Spawnkiller ++ " " ++ Command}, PortOptions),
-        writer=fun ?MODULE:writejson/2,
-        reader=fun ?MODULE:readjson/1,
-        idle=IdleLimit
-    },
-    KillCmd = iolist_to_binary(readline(BaseProc)),
+    BaseProc = case string:str(Command, "main-async.js") of
+		       0 -> #os_proc{
+			       command=Command,
+			       port=open_port({spawn, Spawnkiller ++ " " ++ Command}, PortOptions),
+			       writer=fun ?MODULE:writejson/2,
+			       reader=fun ?MODULE:readjson/1,
+			       idle=IdleLimit
+			    };
+		       _ -> #os_proc{
+			       command=Command,
+			       %don't use Spawnkiller here since it would assume a line based protocol. 
+			       %TODO find a way to use Spawnkiller
+			       port=open_port({spawn, Command}, ?PORT_OPTIONS_BERT),
+			       writer=fun ?MODULE:writebert/2,
+			       reader=fun ?MODULE:readbert/1,
+			       idle=IdleLimit
+			    }
+	       end,
+    couch_log:info("OS Process Started :: ~s", [Command]),
+
+    %We didn't sart with Spwankiller, so we can't read the KillCmd
+    %KillCmd = iolist_to_binary(readline(BaseProc)),
     Pid = self(),
-    couch_log:debug("OS Process Start :: ~p", [BaseProc#os_proc.port]),
-    spawn(fun() ->
-            % this ensure the real os process is killed when this process dies.
-            erlang:monitor(process, Pid),
-            receive _ -> ok end,
-            killer(?b2l(KillCmd))
-        end),
+    couch_log:info("OS Process Start :: ~p", [BaseProc#os_proc.port]),
+    %spawn(fun() ->
+    %        % this ensure the real os process is killed when this process dies.
+    %        erlang:monitor(process, Pid),
+    %        receive _ -> ok end,
+    %        killer(?b2l(KillCmd))
+    %    end),
     OsProc =
     lists:foldl(fun(Opt, Proc) ->
         case Opt of
