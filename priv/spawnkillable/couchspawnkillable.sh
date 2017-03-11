@@ -16,5 +16,29 @@
 # the actual process. This provides a way for Erlang to hard-kill its external
 # processes.
 
-echo "kill -9 $$"
-exec $*
+killCmd="kill -9 $$"
+Cmd=$*
+
+if [ "$1" == "--bert" ]; 
+  then
+    #send packet with 4 bytes length header
+    
+    #get $killCmd length and format it as 4 digit hex string
+    hexLength=$(printf "%08X" ${#killCmd})
+    
+    #extract the 4 hex digits
+    d1=${hexLength:0:2}
+    d2=${hexLength:2:2}
+    d3=${hexLength:4:2}
+    d4=${hexLength:6:2}
+   
+    #print the killCmd preceding the 4 bytes 
+    printf "\x$d1\x$d2\x$d3\x$d4%s" "$killCmd"
+
+    #strip the first command line argument
+    Cmd=${*:2}
+  else
+    echo $killCmd 
+fi
+
+exec $Cmd

@@ -186,36 +186,38 @@ init([Command, Options, PortOptions]) ->
     Spawnkiller = "\"" ++ filename:join(PrivDir, "couchspawnkillable") ++ "\"",
     V = config:get("query_server_config", "os_process_idle_limit", "300"),
     IdleLimit = list_to_integer(V) * 1000,
-    BaseProc = case string:str(Command, "main-async.js") of
-		       0 -> #os_proc{
-			       command=Command,
-			       port=open_port({spawn, Spawnkiller ++ " " ++ Command}, PortOptions),
-			       writer=fun ?MODULE:writejson/2,
-			       reader=fun ?MODULE:readjson/1,
-			       idle=IdleLimit
-			    };
-		       _ -> #os_proc{
-			       command=Command,
-			       %don't use Spawnkiller here since it would assume a line based protocol. 
-			       %TODO find a way to use Spawnkiller
-			       port=open_port({spawn, Command}, ?PORT_OPTIONS_BERT),
-			       writer=fun ?MODULE:writebert/2,
-			       reader=fun ?MODULE:readbert/1,
-			       idle=IdleLimit
-			    }
+    {BaseProc, KillCmd} = case string:str(Command, "main-bert.js") of
+		       0 ->
+             BProc =  #os_proc{
+			             command=Command,
+			             port=open_port({spawn, Spawnkiller ++ " " ++ Command}, PortOptions),
+			             writer=fun ?MODULE:writejson/2,
+			             reader=fun ?MODULE:readjson/1,
+			             idle=IdleLimit
+			       },
+             {BProc, iolist_to_binary(readline(BProc))};
+		       _ -> 
+             BProc = #os_proc{
+			             command=Command,
+			             port=open_port({spawn, Spawnkiller ++ " --bert " ++ Command}, ?PORT_OPTIONS_BERT),
+			             writer=fun ?MODULE:writebert/2,
+			             reader=fun ?MODULE:readbert/1,
+			             idle=IdleLimit
+			       },
+             {BProc, iolist_to_binary(readbertpacket(BProc))}
 	       end,
+    
     couch_log:info("OS Process Started :: ~s", [Command]),
-
-    %We didn't sart with Spwankiller, so we can't read the KillCmd
-    %KillCmd = iolist_to_binary(readline(BaseProc)),
+    couch_log:info("OS Process KillCmd:: ~s", [KillCmd]),
+    
     Pid = self(),
     couch_log:info("OS Process Start :: ~p", [BaseProc#os_proc.port]),
-    %spawn(fun() ->
-    %        % this ensure the real os process is killed when this process dies.
-    %        erlang:monitor(process, Pid),
-    %        receive _ -> ok end,
-    %        killer(?b2l(KillCmd))
-    %    end),
+    spawn(fun() ->
+            % this ensure the real os process is killed when this process dies.
+            erlang:monitor(process, Pid),
+            receive _ -> ok end,
+            killer(?b2l(KillCmd))
+        end),
     OsProc =
     lists:foldl(fun(Opt, Proc) ->
         case Opt of
